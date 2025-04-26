@@ -7,6 +7,7 @@ including CSDA-based residual energy estimation and LET-based dose models.
 """
 
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 from scipy.integrate import cumulative_trapezoid
 from pysrim import SR, Ion, Layer
@@ -60,9 +61,10 @@ def run_srim_with_timeout(srim, timeout):
         future = executor.submit(srim.run)
         return future.result(timeout=timeout)
 
-def residual_energy(ion: Ion, layer: Layer, depth_mm=None, precision_keV=10, timeout=60):
+def csda_energy_and_range(ion: Ion, layer: Layer, depth_mm=None, precision_keV=10, timeout=10):
     """
-    Calculate the residual energy of an ion after passing through a target material.
+    Calculate the residual energy and range of an ion after passing through a target material
+    using the continuous slowing down approximation.
 
     Parameters:
     -----------
@@ -85,29 +87,10 @@ def residual_energy(ion: Ion, layer: Layer, depth_mm=None, precision_keV=10, tim
     """
     # Use the layer width as the default depth if none is given
     depth = depth_mm if depth_mm is not None else layer.width / 1e7  # Convert Å → mm
-
-    # Prepare a list of energy perturbations to try if SRIM fails (e.g. ±10, ±20 ... keV)
-    base_energy_MeV = ion.energy / 1e6
-    perturbations = [0] + [i * precision_keV / 1000 for i in range(1, 6)]
-    adjustments = [delta for pair in zip(perturbations[1:], [-x for x in perturbations[1:]]) for delta in pair]
-    adjustments.insert(0, 0.0)  # Ensure original energy is tried first
-
-    # Try running SRIM with adjusted energies until successful or out of retries
-    for delta in adjustments:
-        try_energy = base_energy_MeV + delta
-        energy_safe = safe_ion_energy(try_energy, precision_keV)
-        safe_ion = Ion(ion.symbol, energy=energy_safe * 1e6)  # Convert MeV → eV
-
-        srim = SR(layer, safe_ion, output_type=5)  # Output type 5 = MeV·cm²/mg
-        try:
-            # print(f"Trying SRIM with {energy_safe:.6f} MeV (Δ = {delta:+.4f} MeV)")
-            results = run_srim_with_timeout(srim, timeout=timeout)
-            break  # Exit loop on successful SRIM run
-        except Exception as e:
-            print(f"⚠️  SRIM failed or timed out at {energy_safe:.6f} MeV (Δ = {delta:+.4f} MeV): {str(e)}")
-    else:
-        # If all energy variants fail, raise an error
-        raise RuntimeError(f"❌ SRIM failed for all energy perturbations near {base_energy_MeV:.6f} MeV.")
+    energy_safe = safe_ion_energy(ion.energy / 1e6, precision_keV)
+    safe_ion = Ion(ion.symbol, energy=energy_safe * 1e6)  # Convert MeV → eV
+    srim = SR(layer, safe_ion, output_type=5)  # Output type 5 = MeV·cm²/mg
+    results = srim.run()
 
     # Extract energy and stopping power from SRIM output
     E = np.array(results.data[0]) * 1e-3  # Convert energy from keV to MeV
@@ -131,8 +114,17 @@ def residual_energy(ion: Ion, layer: Layer, depth_mm=None, precision_keV=10, tim
     depth_input = np.atleast_1d(depth)  # Always treat input as array for safety
     energy_out = E_vs_depth(depth_input)
 
-    # Return scalar if input was scalar, else full array
-    return float(energy_out[0]) if np.isscalar(depth) else energy_out
+    # Remaining ion range in this layer
+    ion_range_mm = depth_cumulative[-1]
+
+    if np.isscalar(depth):
+        remaining_range_mm = ion_range_mm - depth
+    else:
+        remaining_range_mm = ion_range_mm - np.max(depth)
+
+    remaining_range_mm = 0.0 if remaining_range_mm < 0.0 else remaining_range_mm
+
+    return (float(energy_out[0]) if np.isscalar(depth) else energy_out, ion_range_mm, remaining_range_mm)
 
 def residual_energy_through_stack(ion, layer_stack, verbose=True):
     """
@@ -159,22 +151,16 @@ def residual_energy_through_stack(ion, layer_stack, verbose=True):
     energy_profile = []
 
     for i, layer in enumerate(layer_stack):
-        # Extract physical thickness of the layer in mm
-        layer_thickness_mm = layer.width / 1e7  # width is in Angstroms
-
         # Check for zero-thickness layers and skip them
-        if layer_thickness_mm <= 0:
+        if layer.width <= 0:
             if verbose:
                 print(f"Warning: Skipping layer {i+1} ({layer.name}) with zero or negative width.")
             energy_profile.append(current_energy)
             continue
 
-        # Define ion at current energy
-        ion_segment = Ion(ion.symbol, energy=current_energy * 1e6)  # energy in eV
-
         # Compute residual energy
-        energy_after_layer = residual_energy(
-            ion_segment,
+        energy_after_layer, _, _ = csda_energy_and_range(
+            Ion(ion.symbol, energy=current_energy * 1e6),
             layer
         )
 
@@ -191,10 +177,107 @@ def residual_energy_through_stack(ion, layer_stack, verbose=True):
 
         current_energy = energy_after_layer
         energy_profile.append(current_energy)
+    
+    # Compute the range left in Silicon
+    if energy_after_layer > 0.0:
+        _, range_left_silicon, _ = csda_energy_and_range(
+            Ion(ion.symbol, energy=current_energy * 1e6),
+            Layer(elements={'Si': {'stoich': 1.0, 'E_d': 15.0, 'lattice': 0.0, 'surface': 4.7}}, density=2.33, width=0.0)
+            )
+    else:
+        range_left_silicon = 0.0
 
-    return current_energy, energy_profile
+    return current_energy, energy_profile, range_left_silicon
 
-def compute_tid(ion, layer_stack, fluence, verbose=True, timeout=60, precision_keV=10):
+
+def energy_profile_through_stack(ion, layer_stack, verbose=True, granular=1):
+    """
+    Calculate the residual energy of an ion after passing through a stack of layers.
+
+    Parameters:
+    -----------
+    ion : srim.Ion
+        Incident ion (initial state), defined using srim.Ion.
+    layer_stack : list of srim.Layer
+        List of Layer objects representing the material stack.
+    verbose : bool, optional
+        If True, print energy after each layer. Default is True.
+    granular : int, optional
+        If > 1, returns detailed energy profiles through each layer with this many points.
+        Default is 1, which returns only the final energy after each layer.
+
+    Returns:
+    --------
+    final_energy : float
+        Ion energy (in MeV) after traversing all layers in the stack.
+
+    energy_profile : list of lists
+        If granular=1: List of single energy values (in MeV) after each layer.
+        If granular>1: List of arrays, where each array contains energy points through a specific layer.
+
+    range_left_silicon : float
+        Remaining range in silicon after traversing the stack.
+    """
+    current_energy = ion.energy / 1e6  # Convert from eV to MeV
+    energy_profile = []
+
+    for i, layer in enumerate(layer_stack):
+        # Check for zero-thickness layers and skip them
+        if layer.width <= 0:
+            if verbose:
+                print(f"Warning: Skipping layer {i+1} ({layer.name}) with zero or negative width.")
+            energy_profile.append([current_energy])
+            continue
+
+        # Create depth vector if granular > 1
+        if granular > 1:
+            layer_depth_mm = layer.width / 1e7  # Convert Å → mm
+            depths = np.linspace(0, layer_depth_mm, granular)
+            energy_after_layer, _, _ = csda_energy_and_range(
+                Ion(ion.symbol, energy=current_energy * 1e6),
+                layer,
+                depth_mm=depths
+            )
+            # Convert to list to ensure consistent return type
+            energy_profile.append(energy_after_layer.tolist())
+        else:
+            energy_after_layer, _, _ = csda_energy_and_range(
+                Ion(ion.symbol, energy=current_energy * 1e6),
+                layer
+            )
+            energy_profile.append([energy_after_layer])
+
+        # Optional logging
+        if verbose:
+            if granular > 1:
+                print(f"Energy profile through layer {i+1} ({layer.name}): {energy_after_layer[0]:.3f} → {energy_after_layer[-1]:.3f} MeV")
+            else:
+                print(f"Energy after layer {i+1} ({layer.name}): {energy_after_layer} MeV")
+
+        # Stop early if ion is fully stopped
+        if (granular > 1 and energy_after_layer[-1] <= 0) or (granular == 1 and energy_after_layer <= 0):
+            if verbose:
+                print(f"Ion stopped in layer {i+1} ({layer.name}).")
+            if granular > 1:
+                energy_profile[-1] = energy_after_layer.tolist()
+            else:
+                energy_profile[-1] = [0.0]
+            return 0.0, energy_profile, 0.0
+
+        current_energy = energy_after_layer[-1] if granular > 1 else energy_after_layer
+    
+    # Compute the range left in Silicon
+    if current_energy > 0.0:
+        _, range_left_silicon, _ = csda_energy_and_range(
+            Ion(ion.symbol, energy=current_energy * 1e6),
+            Layer(elements={'Si': {'stoich': 1.0, 'E_d': 15.0, 'lattice': 0.0, 'surface': 4.7}}, density=2.33, width=0.0)
+            )
+    else:
+        range_left_silicon = 0.0
+
+    return current_energy, energy_profile, range_left_silicon
+
+def compute_tid_silicon(ion, layer_stack, fluence, verbose=True, timeout=60, precision_keV=10):
     """
     Compute Total Ionizing Dose (TID) in Silicon after ion passes through a material stack.
 
@@ -224,16 +307,16 @@ def compute_tid(ion, layer_stack, fluence, verbose=True, timeout=60, precision_k
     k = 1.602e-5  # Conversion constant: rads / (MeV * mg / cm^2)
 
     # Step 1: Propagate through the stack to get residual energy
-    residual_E, _ = residual_energy_through_stack(
+    residual_E, _, _ = residual_energy_through_stack(
         ion,
         layer_stack,
         verbose=verbose
     )
 
-    if residual_E <= 0:
+    if np.isnan(residual_E)or(safe_ion_energy(residual_E, precision_keV) <= 0.0):
         if verbose:
             print("Warning: Ion fully stopped before reaching silicon. TID = 0.")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0  
 
     # Step 2: Compute LET(E) in Silicon using SRIM
     si_layer = Layer(
@@ -243,13 +326,9 @@ def compute_tid(ion, layer_stack, fluence, verbose=True, timeout=60, precision_k
         name="Si"
     )
 
-    try:
-        si_ion = Ion(ion.symbol, energy=safe_ion_energy(residual_E, precision_keV) * 1e6)  # MeV → eV
-        srim = SR(si_layer, si_ion, output_type=5)
-        results = run_srim_with_timeout(srim, timeout=timeout)
-    except Exception as e:
-        print(f"⚠️ SRIM failed when calculating LET in Si at {residual_E:.6f} MeV: {e}")
-        return residual_E, np.nan
+    in_ion = Ion(ion.symbol, energy=safe_ion_energy(residual_E, precision_keV) * 1e6)
+    srim = SR(si_layer, in_ion, output_type=5)
+    results = run_srim_with_timeout(srim, timeout=timeout)
 
     # Interpolate LET from SRIM table
     energies = np.array(results.data[0]) * 1e-3  # keV → MeV
@@ -260,12 +339,57 @@ def compute_tid(ion, layer_stack, fluence, verbose=True, timeout=60, precision_k
     # Step 3: Compute TID
     tid = k * fluence * LET_interp  # rads
 
+    # Convert stopping power to MeV/mm using material density
+    density_mg_cm3 = si_layer.density * 1000        # g/cm³ → mg/cm³
+    S_mm = LETs * density_mg_cm3 / 10               # MeV/mm
+
+    # Integrate CSDA range: compute depth as a function of energy
+    depth_cumulative = -cumulative_trapezoid(1 / S_mm[::-1], energies[::-1], initial=0)  # [mm]
+    ion_range_mm = depth_cumulative[-1]
+
     if verbose:
         print(f"Residual energy: {residual_E:.2f} MeV")
+        print(f"Range in silicon: {ion_range_mm*1e3:.2f} microns")
         print(f"Interpolated LET in Si: {LET_interp:.4f} MeV·cm²/mg")
         print(f"TID: {tid:.2f} rad")
 
-    return residual_E, tid
+    return residual_E, ion_range_mm, tid
+
+def plot_energy_profile(energy_profile, stack=None):
+    """
+    Plot the energy profile of an ion through a material stack.
+    """
+    # Flatten energy profile for plotting
+    energies = [energy for layer_energies in energy_profile for energy in layer_energies]
+
+    # Create relative depth array (just indices)
+    relative_depths = list(range(len(energies)))
+
+    # Create the plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(relative_depths, energies, 'b-', linewidth=2)
+    plt.xlabel('Relative Depth (index)')
+    plt.ylabel('Energy (MeV)')
+    plt.title('Energy Profile Through Material Stack')
+    plt.grid(True)
+
+    # Add layer boundaries by index
+    current_index = 0
+    for i, layer_energies in enumerate(energy_profile):
+        next_index = current_index + len(layer_energies)
+        plt.axvline(x=next_index, color='r', linestyle='--', alpha=0.5)
+        if stack is not None:
+            plt.text(
+                current_index + len(layer_energies) / 2,
+                (np.min(energies) + np.max(energies)) / 2,
+                stack[i].name,
+                horizontalalignment='center',
+                verticalalignment='top'
+            )
+        current_index = next_index
+
+    plt.tight_layout()
+    plt.show()
 
 def sweep_al_shield_dose(
     al_thicknesses_mm,
@@ -330,7 +454,7 @@ def sweep_al_shield_dose(
                 layer_stack.append(partial_layer)
 
             try:
-                res_E, dose = compute_tid(
+                res_E, dose = compute_tid_silicon(
                     ion,
                     layer_stack,
                     fluence,
